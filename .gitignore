@@ -210,4 +210,6 @@ __marimo__/
 .env
 devices.toml
 config.py
+spool.lp
+spool.lp.*
 *.bak

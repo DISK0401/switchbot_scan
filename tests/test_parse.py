@@ -130,3 +130,126 @@ def test_co2_uses_cached_model_for_manufacturer_only_packet():
 def test_humidity_has_no_float_noise():
     r = sb.parse_meter(service(battery=1, humidity=55), {})
     assert r.humidity == 0.55
+
+
+# --- 未登録のデバイスと名前 ---------------------------------------------------
+def test_unknown_meter_is_recorded_with_mac_name():
+    latest = sb.LatestReadings({}, record_unknown=True)
+    latest.update("aa:bb:cc:dd:ee:09", service(battery=80, model="i"), manufacturer(1, 18, 40), rssi=-70)
+    (point,) = latest.points(stale_seconds=60)
+    assert point["tags"] == {"mac_address": "AA:BB:CC:DD:EE:09", "device_name": "AA:BB:CC:DD:EE:09"}
+    assert point["fields"]["rssi"] == -70
+
+
+def test_unknown_non_meter_is_ignored():
+    """プラグなど温湿度計以外の機器のデータを温度として読まない"""
+    latest = sb.LatestReadings({}, record_unknown=True)
+    plug = {UUID: bytes([ord("j"), 0x00, 0x80])}
+    latest.update("AA:BB:CC:DD:EE:0A", plug, manufacturer(1, 18, 40))
+    assert latest.points(stale_seconds=60) == []
+
+
+def test_unknown_meter_needs_model_before_manufacturer_only_packet():
+    latest = sb.LatestReadings({}, record_unknown=True)
+    latest.update("AA:BB:CC:DD:EE:0B", {}, manufacturer(1, 18, 40))  # 機種がまだ分からない
+    assert latest.points(stale_seconds=60) == []
+    latest.update("AA:BB:CC:DD:EE:0B", service(battery=50, model="w"), {})
+    latest.update("AA:BB:CC:DD:EE:0B", {}, manufacturer(1, 18, 40))
+    (point,) = latest.points(stale_seconds=60)
+    assert point["fields"]["temperature"] == 18.1
+
+
+def test_unknown_is_ignored_when_disabled():
+    latest = sb.LatestReadings({}, record_unknown=False)
+    latest.update("AA:BB:CC:DD:EE:0C", service(battery=50, temp_int=20, humidity=40), {})
+    assert latest.points(stale_seconds=60) == []
+
+
+def test_name_priority():
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:01", name="toml の名前")
+    latest = sb.LatestReadings({dev.mac: dev}, record_unknown=True)
+    latest.api_names = {"AA:BB:CC:DD:EE:01": "API の名前", "AA:BB:CC:DD:EE:02": "API の名前2"}
+    assert latest.device_for("AA:BB:CC:DD:EE:01").name == "toml の名前"
+    assert latest.device_for("AA:BB:CC:DD:EE:02").name == "API の名前2"
+    assert latest.device_for("AA:BB:CC:DD:EE:03").name == "AA:BB:CC:DD:EE:03"
+
+
+def test_parse_device_list():
+    body = {"statusCode": 100, "message": "success", "body": {"deviceList": [
+        {"deviceId": "aabbccddee01", "deviceName": "書斎", "deviceType": "Meter"},
+        {"deviceId": "210", "deviceName": "MAC 形式ではない ID"},
+    ], "infraredRemoteList": []}}
+    assert sb.parse_device_list(body) == {"AA:BB:CC:DD:EE:01": "書斎"}
+    with pytest.raises(RuntimeError):
+        sb.parse_device_list({"statusCode": 190, "message": "Unauthorized"})
+
+
+def test_api_headers():
+    import base64, hashlib, hmac
+    h = sb.switchbot_api_headers("tok", "sec", t="1700000000000", nonce="n-1")
+    expected = base64.b64encode(hmac.new(b"sec", b"tok1700000000000n-1", hashlib.sha256).digest()).decode()
+    assert h["Authorization"] == "tok" and h["sign"] == expected and h["t"] == "1700000000000" and h["nonce"] == "n-1"
+
+
+# --- 書き込めなかったデータの保存と再送 ---------------------------------------
+class FakeInflux:
+    def __init__(self):
+        self.written: list[str] = []
+        self.error: Exception | None = None
+
+    def write(self, lines):
+        if self.error:
+            raise self.error
+        self.written += lines
+
+
+class HttpError(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+def test_spool_keeps_data_while_down_and_resends(tmp_path):
+    spool, db = sb.Spool(tmp_path / "spool.lp", 10_000_000), FakeInflux()
+    db.error = ConnectionError("down")
+    spool.flush(db.write, ["a 1"], sb.is_retryable_error)
+    spool.flush(db.write, ["b 2"], sb.is_retryable_error)
+    assert db.written == [] and sb.Spool(tmp_path / "spool.lp", 1).lines() == ["a 1", "b 2"]  # 再起動しても残る
+    db.error = None
+    spool.flush(db.write, ["c 3"], sb.is_retryable_error)
+    assert sorted(db.written) == ["a 1", "b 2", "c 3"] and not (tmp_path / "spool.lp").exists()
+
+
+def test_spool_rejects_bad_data(tmp_path):
+    spool, db = sb.Spool(tmp_path / "spool.lp", 10_000_000), FakeInflux()
+    db.error = HttpError(422)
+    spool.flush(db.write, ["bad 1"], sb.is_retryable_error)
+    assert not (tmp_path / "spool.lp").exists()
+    assert (tmp_path / "spool.lp.rejected").read_text(encoding="utf-8") == "bad 1\n"
+
+
+def test_spool_trims_oldest_when_full(tmp_path):
+    spool, db = sb.Spool(tmp_path / "spool.lp", 100), FakeInflux()
+    db.error = HttpError(503)
+    for i in range(30):
+        spool.flush(db.write, [f"line{i:02d}"], sb.is_retryable_error)
+    lines = spool.lines()
+    assert lines[-1] == "line29" and "line00" not in lines
+    assert (tmp_path / "spool.lp").stat().st_size <= 100
+
+
+def test_retryable_classification():
+    assert sb.is_retryable_error(ConnectionError())
+    assert sb.is_retryable_error(HttpError(503)) and sb.is_retryable_error(HttpError(429))
+    assert sb.is_retryable_error(HttpError(401)) and sb.is_retryable_error(HttpError(404))
+    assert not sb.is_retryable_error(HttpError(400)) and not sb.is_retryable_error(HttpError(422))
+
+
+def test_point_to_line_protocol():
+    from influxdb_client import Point, WritePrecision
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:01", name="リビング")
+    when = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    p = sb.build_point(dev, sb.Reading(battery=90, temperature=21.0, humidity=0.45, rssi=-60), when)
+    line = Point.from_dict(p, write_precision=WritePrecision.NS).to_line_protocol()
+    assert line == ("switchbot_smartmeter,device_name=リビング,mac_address=AA:BB:CC:DD:EE:01 "
+                    "battery=90i,humidity=0.45,rssi=-60i,temperature=21 1767225600000000000")  # i が無いので float
