@@ -4,10 +4,15 @@ SwitchBot 温湿度計が発信している Bluetooth Low Energy（BLE）のア�
 
 ## 対応しているデバイス
 
-| `type` | 対象 | 受信するデータ |
-|---|---|---|
-| `old` | 温湿度計（旧型） | 温度・湿度・電池残量をすべて Service Data から取得 |
-| `new` | 防水温湿度計（屋外用）など | 電池残量を Service Data、温度・湿度を Manufacturer Data から取得 |
+| 機種 | 記録する値 |
+|---|---|
+| 温湿度計（Meter） | 温度・湿度・電池残量 |
+| 温湿度計プラス（Meter Plus） | 温度・湿度・電池残量 |
+| 防水温湿度計（Indoor/Outdoor Thermo-Hygrometer） | 温度・湿度・電池残量 |
+| 温湿度計 Pro（Meter Pro） | 温度・湿度・電池残量 |
+| CO2 センサー（Meter Pro CO2） | 温度・湿度・電池残量・CO2 濃度 |
+
+機種は受信したデータから自動で判別します。電池残量は Service Data から、温度と湿度は Manufacturer Data から読み、Manufacturer Data に温度と湿度が含まれない旧ファームウェアでは Service Data から読みます。解析の方法は Home Assistant が使っている [pySwitchbot](https://github.com/sblibs/pySwitchbot) に合わせています。
 
 ## InfluxDB に記録するデータ
 
@@ -19,12 +24,13 @@ SwitchBot 温湿度計が発信している Bluetooth Low Energy（BLE）のア�
 | field | `temperature` | 温度（℃、小数第1位まで） |
 | field | `humidity` | 湿度（0.0〜1.0。55% なら 0.55） |
 | field | `battery` | 電池残量（%） |
+| field | `co2` | CO2 濃度（ppm。Meter Pro CO2 のみ） |
 
 受信できなかった値は -1 などの仮の値で埋めず、記録から省きます。
 
 ## 必要なもの
 
-- BlueZ が動作している Linux と、Bluetooth アダプター
+- Bluetooth アダプターのある Linux（BlueZ が動作しているもの）。Windows でも動作します（「Windows で使う」を参照）
 - [mise](https://mise.jdx.dev/)。Python と uv のバージョンを `mise.toml` で管理します
 - 書き込み権限のある InfluxDB v2 のトークン
 
@@ -52,8 +58,9 @@ sudo cp devices.example.toml devices.toml           # 対象デバイスを記�
 [[devices]]
 mac  = "AA:BB:CC:DD:EE:01"   # SwitchBot アプリの「デバイス情報」で確認できます
 name = "リビング"             # InfluxDB の device_name タグになります
-type = "old"                 # 旧型温湿度計は old、屋外用などは new
 ```
+
+以前のバージョンで使っていた `type = "old"` / `type = "new"` は、書いたままでも動作します。機種は自動で判別するため、この値は使いません。
 
 ## 動作確認
 
@@ -78,6 +85,8 @@ sudo systemctl enable --now switchbot_scan.service
 journalctl -u switchbot_scan.service -f    # ログの確認
 ```
 
+BLE の受信が `SWITCHBOT_WATCHDOG_SECONDS`（既定は 600 秒）のあいだ途絶えると、プログラムはエラーで終了し、systemd が再起動します。bluetoothd の再起動などでスキャンが止まっても、エラーが出ないまま記録だけが途切れることを防ぐためです。
+
 ## 更新
 
 ```bash
@@ -89,6 +98,30 @@ sudo systemctl restart switchbot_scan.service
 ```
 
 `mise.toml` の Python のバージョンを上げたときは、`.venv` を削除してから `mise exec -- uv sync --no-dev` を実行し、新しい Python で作り直してください。
+
+## Windows で使う
+
+Windows では、Bluetooth アダプターがあれば同じプログラムで受信できます。PowerShell で次のように実行します。
+
+```powershell
+winget install jdx.mise
+git clone https://github.com/DISK0401/switchot_scan.git
+cd switchot_scan
+mise trust; mise install
+mise exec -- uv sync --no-dev
+Copy-Item .env.example .env; Copy-Item devices.example.toml devices.toml   # それぞれ記入する
+mise exec -- uv run python switchbot_scan.py --dry-run --once
+```
+
+Windows には systemd がないため、ウォッチドッグで終了したあとに起動し直す処理を自分で用意します。たとえば、次の内容の PowerShell スクリプトを、タスク スケジューラで「ログオン時」に実行するよう登録します。
+
+```powershell
+Set-Location C:\path\to\switchot_scan
+while ($true) {
+    .\.venv\Scripts\python.exe switchbot_scan.py
+    Start-Sleep -Seconds 10
+}
+```
 
 ## 開発
 

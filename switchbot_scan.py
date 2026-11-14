@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 import time
 import tomllib
@@ -41,7 +42,7 @@ SWITCHBOT_SERVICE_UUIDS = (
 class Device:
     mac: str
     name: str
-    type: str  # "old"（旧型温湿度計） / "new"（新型・屋外用など）
+    type: str = "auto"  # 互換のため残している。機種は受信データから判別する
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class Settings:
     influx_bucket: str
     interval_seconds: float
     stale_seconds: float
+    watchdog_seconds: float
     devices: dict[str, Device]
 
 
@@ -61,9 +63,9 @@ def load_devices(path: Path) -> dict[str, Device]:
     devices: dict[str, Device] = {}
     for entry in data.get("devices", []):
         mac = str(entry["mac"]).upper()
-        dev_type = str(entry.get("type", "old"))
-        if dev_type not in ("old", "new"):
-            raise ValueError(f"{path}: {mac} の type は 'old' か 'new' を指定してください（{dev_type!r}）")
+        dev_type = str(entry.get("type", "auto"))
+        if dev_type not in ("auto", "old", "new"):
+            raise ValueError(f"{path}: {mac} の type は省略するか 'auto' / 'old' / 'new' を指定してください（{dev_type!r}）")
         devices[mac] = Device(mac=mac, name=str(entry["name"]), type=dev_type)
     if not devices:
         raise ValueError(f"{path}: [[devices]] が1件も定義されていません")
@@ -96,6 +98,7 @@ def load_settings(require_influx: bool) -> Settings:
         influx_bucket=env("INFLUXDB_BUCKET"),
         interval_seconds=float(os.environ.get("SWITCHBOT_INTERVAL_SECONDS", "10")),
         stale_seconds=float(os.environ.get("SWITCHBOT_STALE_SECONDS", "300")),
+        watchdog_seconds=float(os.environ.get("SWITCHBOT_WATCHDOG_SECONDS", "600")),
         devices=load_devices(devices_file),
     )
 
@@ -105,22 +108,39 @@ def load_settings(require_influx: bool) -> Settings:
 #   service_data      : {UUID 文字列: UUID を除いたデータ}
 #   manufacturer_data : {会社 ID: 会社 ID を除いたデータ}
 # ---------------------------------------------------------------------------
+# 機種コード（Service Data 先頭バイトの下位7bit）。参考: pySwitchbot の adv_parser.py
+METER_MODELS = {
+    "T": "Meter",
+    "i": "Meter Plus",
+    "w": "Indoor/Outdoor Thermo-Hygrometer",
+    "4": "Meter Pro",
+    "5": "Meter Pro CO2",
+}
+CO2_MAX_PPM = 9999
+
+
 @dataclass
 class Reading:
     battery: Optional[int] = None
     temperature: Optional[float] = None
     humidity: Optional[float] = None  # 0.0〜1.0（従来データとの互換のため % / 100 で記録）
+    co2: Optional[int] = None  # ppm（Meter Pro CO2 のみ）
 
     def has_any(self) -> bool:
-        return any(v is not None for v in (self.battery, self.temperature, self.humidity))
+        return any(v is not None for v in (self.battery, self.temperature, self.humidity, self.co2))
 
 
 def _decode_temperature(decimal_byte: int, integer_byte: int) -> float:
-    """下位4bit=小数第1位、次バイト下位7bit=整数部、最上位bit=0 のとき氷点下"""
+    """下位4bit=小数第1位、次バイト下位7bit=整数部、最上位bit=0 のとき氷点下（値は常に摂氏）"""
     temperature = (decimal_byte & 0b00001111) / 10 + (integer_byte & 0b01111111)
     if not integer_byte & 0b10000000:
         temperature = -temperature
     return round(temperature, 1)
+
+
+def _decode_humidity(byte: int) -> float:
+    """下位7bit=湿度(%)。最上位bit は本体の表示単位（華氏）のフラグなので使わない"""
+    return (byte & 0b01111111) / 100
 
 
 def _switchbot_service_data(service_data: Mapping[str, bytes]) -> Optional[bytes]:
@@ -130,32 +150,45 @@ def _switchbot_service_data(service_data: Mapping[str, bytes]) -> Optional[bytes
     return None
 
 
-def parse_old_device(service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes]) -> Reading:
-    """旧型温湿度計: Service Data に電池・温度・湿度がすべて含まれる"""
-    reading = Reading()
+def detect_model(service_data: Mapping[str, bytes]) -> Optional[str]:
+    """Service Data の先頭バイトから機種コードを返す（温湿度計でなければ None）"""
     data = _switchbot_service_data(service_data)
-    if data is not None and len(data) >= 6:
-        reading.battery = data[2] & 0b01111111
-        reading.temperature = _decode_temperature(data[3], data[4])
-        reading.humidity = (data[5] & 0b01111111) * 0.01
-    return reading
+    if not data:
+        return None
+    code = chr(data[0] & 0b01111111)
+    return code if code in METER_MODELS else None
 
 
-def parse_new_device(service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes]) -> Reading:
-    """新型（屋外用など）: 電池は Service Data、温度・湿度は Manufacturer Data（MAC 6byte の後）に含まれる"""
+def parse_meter(service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes],
+                model: Optional[str] = None) -> Reading:
+    """温湿度計のアドバタイズを解析する。
+
+    - 電池残量 : Service Data の [2]
+    - 温度・湿度: Manufacturer Data（会社 ID の後、MAC 6byte に続く [2]〜[4]）を優先し、
+                  無ければ Service Data の [3]〜[5]（旧型の Meter や旧ファームウェア）
+    - CO2      : Meter Pro CO2 のみ、Manufacturer Data の [13]〜[14]（ビッグエンディアン）
+    新型は電池と温湿度が別のパケットで届くことがあるため、どちらか片方だけでも返す。
+    """
     reading = Reading()
     data = _switchbot_service_data(service_data)
+    model = detect_model(service_data) or model
+
     if data is not None and len(data) >= 3:
         reading.battery = data[2] & 0b01111111
+
     mdata = manufacturer_data.get(SWITCHBOT_COMPANY_ID)
-    if mdata is not None and len(mdata) >= 6 + 5:
-        payload = mdata[6:]
-        reading.temperature = _decode_temperature(payload[2], payload[3])
-        reading.humidity = (payload[4] & 0b01111111) * 0.01
+    if mdata is not None and len(mdata) >= 11:
+        reading.temperature = _decode_temperature(mdata[8], mdata[9])
+        reading.humidity = _decode_humidity(mdata[10])
+    elif data is not None and len(data) >= 6:
+        reading.temperature = _decode_temperature(data[3], data[4])
+        reading.humidity = _decode_humidity(data[5])
+
+    if model == "5" and mdata is not None and len(mdata) >= 15:
+        co2 = int.from_bytes(mdata[13:15], "big")
+        if co2 <= CO2_MAX_PPM:
+            reading.co2 = co2
     return reading
-
-
-PARSERS = {"old": parse_old_device, "new": parse_new_device}
 
 
 def build_point(device: Device, reading: Reading, now: datetime) -> dict:
@@ -166,6 +199,8 @@ def build_point(device: Device, reading: Reading, now: datetime) -> dict:
         fields["humidity"] = float(reading.humidity)
     if reading.battery is not None:
         fields["battery"] = int(reading.battery)
+    if reading.co2 is not None:
+        fields["co2"] = int(reading.co2)
     return {
         "measurement": MEASUREMENT,
         "time": now,
@@ -183,19 +218,27 @@ class LatestReadings:
     def __init__(self, devices: dict[str, Device]) -> None:
         self.devices = devices
         self._latest: dict[str, tuple[Reading, float]] = {}
+        self._models: dict[str, str] = {}
+        self.last_received = time.monotonic()  # 対象デバイスから最後に受信した時刻（ウォッチドッグ用）
 
     def update(self, mac: str, service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes]) -> None:
         device = self.devices.get(mac.upper())
         if device is None:
             return
-        new = PARSERS[device.type](service_data, manufacturer_data)
+        model = detect_model(service_data)
+        if model is not None and self._models.get(device.mac) != model:
+            self._models[device.mac] = model
+            logger.info("%s（%s）を %s として認識しました", device.name, device.mac, METER_MODELS[model])
+        new = parse_meter(service_data, manufacturer_data, self._models.get(device.mac))
         if not new.has_any():
             return
+        self.last_received = time.monotonic()
         old, _ = self._latest.get(device.mac, (Reading(), 0.0))
         merged = Reading(
             battery=new.battery if new.battery is not None else old.battery,
             temperature=new.temperature if new.temperature is not None else old.temperature,
             humidity=new.humidity if new.humidity is not None else old.humidity,
+            co2=new.co2 if new.co2 is not None else old.co2,
         )
         self._latest[device.mac] = (merged, time.monotonic())
 
@@ -225,12 +268,28 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
         client = InfluxDBClient(url=settings.influx_url, token=settings.influx_token, org=settings.influx_org)
         write_api = client.write_api(write_options=SYNCHRONOUS)
 
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, stop.set)  # systemctl stop で正常に終了させる
+    except (NotImplementedError, AttributeError):  # Windows では使えない（Ctrl+C で終了する）
+        pass
+
     logger.info("スキャン開始（対象 %d 台、%s 秒ごとに記録%s）",
                 len(settings.devices), settings.interval_seconds, "、dry-run" if dry_run else "")
     try:
         async with BleakScanner(detection_callback=on_advertisement, scanning_mode="active"):
-            while True:
-                await asyncio.sleep(settings.interval_seconds)
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=settings.interval_seconds)
+                    break
+                except TimeoutError:
+                    pass
+                silent = time.monotonic() - latest.last_received
+                if settings.watchdog_seconds > 0 and silent > settings.watchdog_seconds:
+                    # bluetoothd の再起動などでスキャンが止まると、例外が出ないまま受信だけが途絶える。
+                    # 異常終了して systemd（Restart=always）に再起動させる
+                    raise RuntimeError(f"{silent:.0f} 秒間どのデバイスからも受信できていないため終了します")
                 points = latest.points(settings.stale_seconds)
                 if not points:
                     logger.debug("記録対象のデータがありません")
@@ -268,6 +327,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         asyncio.run(run(settings, dry_run=args.dry_run, once=args.once))
     except KeyboardInterrupt:
         pass
+    except RuntimeError as e:
+        logger.error("%s", e)
+        return 1
     return 0
 
 
