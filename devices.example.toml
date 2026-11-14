@@ -1,0 +1,16 @@
+# 対象の SwitchBot 温湿度計の一覧。
+# このファイルを devices.toml にコピーして実際の値を記入する（devices.toml は Git 管理外）。
+#
+# mac  : デバイスの MAC アドレス（SwitchBot アプリの「デバイス情報」で確認）
+# name : InfluxDB の device_name タグに記録される名前
+# type : "old" = 旧型温湿度計 / "new" = 新型（屋外用など。温湿度を Manufacturer Data で送るもの）
+
+[[devices]]
+mac  = "AA:BB:CC:DD:EE:01"
+name = "リビング"
+type = "old"
+
+[[devices]]
+mac  = "AA:BB:CC:DD:EE:02"
+name = "屋外"
+type = "new"

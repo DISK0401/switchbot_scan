@@ -1,0 +1,15 @@
+[Unit]
+Description=Scan SwitchBot meters and register data to InfluxDB
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/switchbot
+EnvironmentFile=/opt/switchbot/.env
+ExecStart=/opt/switchbot/.venv/bin/python switchbot_scan.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[project]
+name = "switchot-scan"
+version = "2.0.0"
+description = "SwitchBot 温湿度計の BLE アドバタイズを受信し、InfluxDB v2 に記録する"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "bleak>=3.1,<4",
+    "influxdb-client>=1.50,<2",
+    "python-dotenv>=1.2,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
