@@ -3,14 +3,13 @@
 #
 # mac  : デバイスの MAC アドレス（SwitchBot アプリの「デバイス情報」で確認）
 # name : InfluxDB の device_name タグに記録される名前
-# type : "old" = 旧型温湿度計 / "new" = 新型（屋外用など。温湿度を Manufacturer Data で送るもの）
+# 機種（Meter / Meter Plus / 防水温湿度計 / Meter Pro / Meter Pro CO2）は受信データから自動で判別する。
+# 以前の版で使っていた type = "old" / "new" は書いたままでも動作する（値は使わない）。
 
 [[devices]]
 mac  = "AA:BB:CC:DD:EE:01"
 name = "リビング"
-type = "old"
 
 [[devices]]
 mac  = "AA:BB:CC:DD:EE:02"
 name = "屋外"
-type = "new"
