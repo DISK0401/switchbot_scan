@@ -61,7 +61,15 @@ sudo cp devices.example.toml devices.toml           # 名前を決めたいデ�
 2. SwitchBot アプリで付けた名前（`.env` に `SWITCHBOT_API_TOKEN` と `SWITCHBOT_API_SECRET` を設定したときだけ）
 3. MAC アドレス
 
-アプリで付けた名前は Bluetooth では送られてこないため、SwitchBot API から取得します。トークンとシークレットは、アプリの「プロフィール > 設定」で「アプリバージョン」を10回タップすると表示される「開発者向けオプション」で確認できます。名前は起動時と、その後は6時間ごとに取得します。アプリで名前を変えると `device_name` も変わるため、名前を固定したいデバイスは `devices.toml` に書いてください。
+アプリで付けた名前は Bluetooth では送られてこないため、SwitchBot API から取得します。トークンとシークレットは、アプリの「プロフィール > 設定」で「アプリバージョン」を10回タップすると表示される「開発者向けオプション」で確認できます。
+
+SwitchBot API を呼び出すのは、`devices.toml` に書いていない温湿度計を見つけたときです。すべての温湿度計を `devices.toml` に書いていれば、API は呼び出しません。
+
+- 名前を取得できるまでは、10分（`SWITCHBOT_NAME_RETRY_SECONDS`）ごとに取得し直します。そのあいだのデータは InfluxDB に送らずに `pending.jsonl` に保存し、名前が分かったら、その名前で受信したときの時刻のまま送ります。MAC アドレスを名前にしたデータが混ざらないようにするためです。
+- 名前を取得できたあとも、名前の変更を反映するため、24時間（`SWITCHBOT_NAME_REFRESH_SECONDS`）ごとに取得します。アプリで名前を変えると `device_name` も変わるため、名前を固定したいデバイスは `devices.toml` に書いてください。
+- 自分のアカウントに登録していない温湿度計（近所のものなど）は、名前を取得できないため記録しません。そのデータは `pending.jsonl` に貯まり続け、上限（`SWITCHBOT_PENDING_MAX_MB`、既定は 10 MB）を超えると古いものから捨てます。
+
+API のトークンを設定していないときは、MAC アドレスを名前にしてすぐに記録します。
 
 近所の温湿度計の電波まで届く環境では、それらも記録されます。`devices.toml` に書いたデバイスだけを記録するには、`.env` に `SWITCHBOT_RECORD_UNKNOWN=0` を設定します。
 

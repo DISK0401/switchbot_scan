@@ -165,13 +165,102 @@ def test_unknown_is_ignored_when_disabled():
     assert latest.points(stale_seconds=60) == []
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def make_resolver(api: dict, clock=None, fail=False):
+    calls = []
+
+    def fetch():
+        calls.append(1)
+        if fail:
+            raise ConnectionError("offline")
+        return dict(api)
+    return sb.NameResolver(fetch, retry_seconds=600, refresh_seconds=86400, clock=clock or FakeClock()), calls
+
+
 def test_name_priority():
     dev = sb.Device(mac="AA:BB:CC:DD:EE:01", name="toml の名前")
-    latest = sb.LatestReadings({dev.mac: dev}, record_unknown=True)
-    latest.api_names = {"AA:BB:CC:DD:EE:01": "API の名前", "AA:BB:CC:DD:EE:02": "API の名前2"}
+    resolver, _ = make_resolver({})
+    resolver.names = {"AA:BB:CC:DD:EE:01": "API の名前", "AA:BB:CC:DD:EE:02": "API の名前2"}
+    latest = sb.LatestReadings({dev.mac: dev}, record_unknown=True, resolver=resolver)
     assert latest.device_for("AA:BB:CC:DD:EE:01").name == "toml の名前"
     assert latest.device_for("AA:BB:CC:DD:EE:02").name == "API の名前2"
     assert latest.device_for("AA:BB:CC:DD:EE:03").name == "AA:BB:CC:DD:EE:03"
+    assert not latest.name_pending("AA:BB:CC:DD:EE:01") and latest.name_pending("AA:BB:CC:DD:EE:03")
+
+
+def test_resolver_not_called_when_all_registered():
+    resolver, calls = make_resolver({"AA:BB:CC:DD:EE:01": "x"})
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:01", name="toml")
+    latest = sb.LatestReadings({dev.mac: dev}, record_unknown=True, resolver=resolver)
+    latest.update(dev.mac, service(battery=50, temp_int=20, humidity=40), {})
+    assert not resolver.due()
+
+
+def test_resolver_fetches_on_unknown_then_retries_every_10_minutes():
+    import asyncio
+    clock = FakeClock()
+    api = {}
+    resolver, calls = make_resolver(api, clock)
+    resolver._fetch = lambda: (calls.append(1), dict(api))[1]
+    latest = sb.LatestReadings({}, record_unknown=True, resolver=resolver)
+    latest.update("AA:BB:CC:DD:EE:09", service(battery=80, model="i", temp_int=20, humidity=40), {})
+    assert resolver.due()                       # 見つけたらすぐ取得する
+    asyncio.run(resolver.update())
+    assert len(calls) == 1 and latest.name_pending("AA:BB:CC:DD:EE:09")
+    clock.now += 599
+    assert not resolver.due()                   # 10 分たつまでは取得しない
+    clock.now += 1
+    assert resolver.due()
+    api["AA:BB:CC:DD:EE:09"] = "書斎"
+    asyncio.run(resolver.update())
+    assert latest.device_for("AA:BB:CC:DD:EE:09").name == "書斎" and not latest.name_pending("AA:BB:CC:DD:EE:09")
+    clock.now += 86399
+    assert not resolver.due()                   # 名前が分かったあとは 24 時間ごと
+    clock.now += 1
+    assert resolver.due()
+    api["AA:BB:CC:DD:EE:09"] = "仕事部屋"
+    asyncio.run(resolver.update())
+    assert latest.device_for("AA:BB:CC:DD:EE:09").name == "仕事部屋"  # 名前の変更を反映
+
+
+def test_resolver_retries_after_api_failure():
+    import asyncio
+    clock = FakeClock()
+    resolver, calls = make_resolver({}, clock, fail=True)
+    resolver.request("AA:BB:CC:DD:EE:09")
+    asyncio.run(resolver.update())
+    assert resolver.unresolved == {"AA:BB:CC:DD:EE:09"} and not resolver.due()
+    clock.now += 600
+    assert resolver.due()
+
+
+def test_pending_store_holds_until_name_known(tmp_path):
+    path = tmp_path / "pending.jsonl"
+    store = sb.PendingStore(path, 10_000_000)
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:09", name="AA:BB:CC:DD:EE:09")
+    when = datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=timezone.utc)
+    store.add([sb.build_point(dev, sb.Reading(battery=80, temperature=20.5, humidity=0.4, rssi=-60), when)])
+    assert store.release(lambda mac: None) == []
+    store = sb.PendingStore(path, 10_000_000)   # 再起動しても残る
+    assert store.macs == {"AA:BB:CC:DD:EE:09"}
+    (p,) = store.release(lambda mac: "書斎")
+    assert p["tags"] == {"mac_address": "AA:BB:CC:DD:EE:09", "device_name": "書斎"}
+    assert p["time"] == 1767225600123456000 and p["fields"]["temperature"] == 20.5
+    assert not path.exists() and store.macs == set()
+
+
+def test_pending_point_to_line_protocol():
+    from influxdb_client import Point, WritePrecision
+    p = {"measurement": sb.MEASUREMENT, "time": 1767225600123456000,
+         "tags": {"mac_address": "AA:BB:CC:DD:EE:09", "device_name": "書斎"}, "fields": {"battery": 80, "temperature": 20.5}}
+    assert Point.from_dict(p, write_precision=WritePrecision.NS).to_line_protocol().endswith(" 1767225600123456000")
 
 
 def test_parse_device_list():

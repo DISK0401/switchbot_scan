@@ -212,4 +212,6 @@ devices.toml
 config.py
 spool.lp
 spool.lp.*
+pending.jsonl
+pending.jsonl.*
 *.bak

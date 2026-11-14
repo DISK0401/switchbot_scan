@@ -66,9 +66,12 @@ class Settings:
     record_unknown: bool = True
     switchbot_token: str = ""
     switchbot_secret: str = ""
-    name_refresh_seconds: float = 6 * 3600
+    name_refresh_seconds: float = 24 * 3600
+    name_retry_seconds: float = 600
     spool_file: Optional[Path] = None
     spool_max_bytes: int = 50 * 1024 * 1024
+    pending_file: Optional[Path] = None
+    pending_max_bytes: int = 10 * 1024 * 1024
 
 
 def load_devices(path: Path) -> dict[str, Device]:
@@ -120,6 +123,7 @@ def load_settings(require_influx: bool) -> Settings:
         raise SystemExit("devices.toml が無く SWITCHBOT_RECORD_UNKNOWN=0 のため、記録するデバイスがありません")
 
     spool_env = os.environ.get("SWITCHBOT_SPOOL_FILE")
+    pending_env = os.environ.get("SWITCHBOT_PENDING_FILE")
     return Settings(
         influx_url=env("INFLUXDB_URL"),
         influx_org=env("INFLUXDB_ORG"),
@@ -132,9 +136,12 @@ def load_settings(require_influx: bool) -> Settings:
         record_unknown=record_unknown,
         switchbot_token=os.environ.get("SWITCHBOT_API_TOKEN", ""),
         switchbot_secret=os.environ.get("SWITCHBOT_API_SECRET", ""),
-        name_refresh_seconds=float(os.environ.get("SWITCHBOT_NAME_REFRESH_SECONDS", str(6 * 3600))),
+        name_refresh_seconds=float(os.environ.get("SWITCHBOT_NAME_REFRESH_SECONDS", str(24 * 3600))),
+        name_retry_seconds=float(os.environ.get("SWITCHBOT_NAME_RETRY_SECONDS", "600")),
         spool_file=Path(spool_env) if spool_env else base_dir / "spool.lp",
         spool_max_bytes=int(float(os.environ.get("SWITCHBOT_SPOOL_MAX_MB", "50")) * 1024 * 1024),
+        pending_file=Path(pending_env) if pending_env else base_dir / "pending.jsonl",
+        pending_max_bytes=int(float(os.environ.get("SWITCHBOT_PENDING_MAX_MB", "10")) * 1024 * 1024),
     )
 
 
@@ -285,6 +292,73 @@ def fetch_device_names(token: str, secret: str, timeout: float = 15) -> dict[str
         return parse_device_list(json.load(response))
 
 
+class NameResolver:
+    """SwitchBot API からデバイス名を取得する時期を決め、取得した名前を保持する。
+
+    - devices.toml に無い温湿度計が見つかったら（request）、すぐに取得する
+    - 名前が見つからない（API の失敗、またはアカウントに無い）デバイスがあるあいだは、retry_seconds ごとに取得し直す
+    - すべての名前が分かったあとは、名前の変更を見つけるため refresh_seconds ごとに取得する
+    API を呼ぶのは devices.toml に無い温湿度計が見つかってからで、すべて devices.toml にあれば呼ばない。
+    """
+
+    def __init__(self, fetch: Callable[[], dict[str, str]], retry_seconds: float, refresh_seconds: float,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._fetch = fetch
+        self.retry_seconds = retry_seconds
+        self.refresh_seconds = refresh_seconds
+        self._clock = clock
+        self.names: dict[str, str] = {}
+        self.unresolved: set[str] = set()
+        self.wanted: set[str] = set()
+        self.last_attempt: Optional[float] = None
+        self.last_success: Optional[float] = None
+        self._busy = False
+
+    def name(self, mac: str) -> Optional[str]:
+        return self.names.get(mac)
+
+    def request(self, mac: str) -> None:
+        self.wanted.add(mac)
+        if mac not in self.names:
+            self.unresolved.add(mac)
+
+    def due(self) -> bool:
+        if self._busy:
+            return False
+        now = self._clock()
+        if self.unresolved:
+            return self.last_attempt is None or now - self.last_attempt >= self.retry_seconds
+        return self.last_success is not None and now - self.last_success >= self.refresh_seconds
+
+    async def update(self) -> None:
+        """取得する時期なら API から名前を取得する（取得中は記録の処理を止めない）"""
+        if not self.due():
+            return
+        self._busy = True
+        self.last_attempt = self._clock()
+        try:
+            names = await asyncio.to_thread(self._fetch)
+        except Exception as e:  # 取得できなくても記録は続ける
+            logger.warning("SwitchBot API からデバイス名を取得できませんでした（%.0f 秒後にもう一度取得します）: %s",
+                           self.retry_seconds, e)
+            return
+        finally:
+            self._busy = False
+        self.last_success = self._clock()
+        for mac in sorted(self.wanted):
+            old, new = self.names.get(mac), names.get(mac)
+            if new is not None and old is None:
+                logger.info("%s の名前を SwitchBot API から取得しました: %s", mac, new)
+            elif new is not None and old != new:
+                logger.info("%s の名前が変わりました: %s → %s", mac, old, new)
+        self.names = names
+        self.unresolved = {mac for mac in self.wanted if mac not in names}
+        if self.unresolved:
+            logger.info("%d 台は SwitchBot API に名前がありません。%.0f 秒後にもう一度取得します"
+                        "（それまでのデータは保存しておきます）: %s",
+                        len(self.unresolved), self.retry_seconds, ", ".join(sorted(self.unresolved)))
+
+
 # ---------------------------------------------------------------------------
 # 受信値の保持
 # ---------------------------------------------------------------------------
@@ -302,18 +376,29 @@ class LatestReadings:
     名前は devices.toml → SwitchBot API → MAC アドレスの順に決める。
     """
 
-    def __init__(self, devices: dict[str, Device], record_unknown: bool = False) -> None:
+    def __init__(self, devices: dict[str, Device], record_unknown: bool = False,
+                 resolver: Optional[NameResolver] = None) -> None:
         self.devices = devices
         self.record_unknown = record_unknown
-        self.api_names: dict[str, str] = {}
+        self.resolver = resolver
         self._latest: dict[str, _Entry] = {}
         self._models: dict[str, str] = {}
         self.last_received = time.monotonic()  # 対象デバイスから最後に受信した時刻（ウォッチドッグ用）
 
+    def known_name(self, mac: str) -> Optional[str]:
+        """devices.toml か SwitchBot API で分かった名前（分からなければ None）"""
+        if mac in self.devices:
+            return self.devices[mac].name
+        return self.resolver.name(mac) if self.resolver else None
+
     def device_for(self, mac: str) -> Device:
         if mac in self.devices:
             return self.devices[mac]
-        return Device(mac=mac, name=self.api_names.get(mac, mac))
+        return Device(mac=mac, name=self.known_name(mac) or mac)
+
+    def name_pending(self, mac: str) -> bool:
+        """SwitchBot API で名前を取得するまで記録を待つデバイスか"""
+        return self.resolver is not None and self.known_name(mac) is None
 
     def update(self, mac: str, service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes],
                rssi: Optional[int] = None) -> None:
@@ -327,6 +412,8 @@ class LatestReadings:
                 logger.info("%s %s として認識しました%s", label, METER_MODELS[model],
                             "" if registered else "（devices.toml に未登録）")
             self._models[mac] = model
+            if not registered and self.record_unknown and self.resolver is not None:
+                self.resolver.request(mac)
         if not registered and not (self.record_unknown and mac in self._models):
             return
         new = parse_meter(service_data, manufacturer_data, self._models.get(mac))
@@ -446,6 +533,51 @@ class Spool:
         logger.info("保存していた %d 行を InfluxDB に送りました", len(pending))
 
 
+class PendingStore:
+    """SwitchBot API で名前を取得できるまで、未登録の温湿度計のデータを保存しておく。
+
+    名前が分かったら、その名前を device_name にして、受信したときの時刻のまま送る。
+    ファイル（JSON Lines）に保存するため、再起動しても失われない。max_bytes を超えたら古いものから捨てる。
+    """
+
+    def __init__(self, path: Path, max_bytes: int) -> None:
+        self._file = Spool(path, max_bytes)
+        self.macs: set[str] = {json.loads(line)["mac"] for line in self._file.lines()}
+
+    def add(self, points: list[dict]) -> None:
+        if not points:
+            return
+        self._file.append([json.dumps({
+            "mac": p["tags"]["mac_address"],
+            "time": int(p["time"].timestamp() * 1_000_000) * 1000,  # ns（マイクロ秒の精度）
+            "fields": p["fields"],
+        }, ensure_ascii=False) for p in points])
+        self.macs.update(p["tags"]["mac_address"] for p in points)
+
+    def release(self, name_of: Callable[[str], Optional[str]]) -> list[dict]:
+        """名前が分かったデバイスのデータを取り出し、point の形にして返す"""
+        if not any(name_of(mac) for mac in self.macs):
+            return []
+        released, kept = [], []
+        for line in self._file.lines():
+            entry = json.loads(line)
+            name = name_of(entry["mac"])
+            if name is None:
+                kept.append(line)
+                continue
+            released.append({
+                "measurement": MEASUREMENT,
+                "time": entry["time"],
+                "tags": {"mac_address": entry["mac"], "device_name": name},
+                "fields": entry["fields"],
+            })
+        self._file._rewrite(kept)
+        self.macs = {json.loads(line)["mac"] for line in kept}
+        if released:
+            logger.info("名前の取得を待っていた %d 件を記録します", len(released))
+        return released
+
+
 def is_retryable_error(e: Exception) -> bool:
     """400・422（データの形の誤りや型の不一致）は再送しても通らないので再送しない。
 
@@ -458,27 +590,21 @@ def is_retryable_error(e: Exception) -> bool:
 # ---------------------------------------------------------------------------
 # 受信と書き込み
 # ---------------------------------------------------------------------------
-async def refresh_names(settings: Settings, latest: LatestReadings, stop: asyncio.Event) -> None:
-    """SwitchBot API からデバイス名を定期的に取得する（トークンを設定したときだけ）"""
-    while not stop.is_set():
-        try:
-            names = await asyncio.to_thread(fetch_device_names, settings.switchbot_token, settings.switchbot_secret)
-        except Exception as e:  # 取得できなくても記録は続ける（前回の名前か MAC アドレスを使う）
-            logger.warning("SwitchBot API からデバイス名を取得できませんでした: %s", e)
-        else:
-            if names != latest.api_names:
-                logger.info("SwitchBot API から %d 台分のデバイス名を取得しました", len(names))
-            latest.api_names = names
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=settings.name_refresh_seconds)
-        except TimeoutError:
-            pass
-
-
 async def run(settings: Settings, dry_run: bool, once: bool) -> None:
     from bleak import BleakScanner  # BLE 環境でのみ必要なため遅延インポート
 
-    latest = LatestReadings(settings.devices, record_unknown=settings.record_unknown)
+    resolver = None
+    if settings.record_unknown and settings.switchbot_token and settings.switchbot_secret:
+        resolver = NameResolver(
+            lambda: fetch_device_names(settings.switchbot_token, settings.switchbot_secret),
+            retry_seconds=settings.name_retry_seconds, refresh_seconds=settings.name_refresh_seconds,
+        )
+    latest = LatestReadings(settings.devices, record_unknown=settings.record_unknown, resolver=resolver)
+    pending = None
+    if resolver is not None and not dry_run and settings.pending_file:
+        pending = PendingStore(settings.pending_file, settings.pending_max_bytes)
+        for mac in pending.macs:  # 前回、名前を取得できないまま終了したデバイス
+            resolver.request(mac)
 
     def on_advertisement(device, adv) -> None:
         latest.update(device.address, adv.service_data, adv.manufacturer_data, adv.rssi)
@@ -510,9 +636,7 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
     except (NotImplementedError, AttributeError):  # Windows では使えない（Ctrl+C で終了する）
         pass
 
-    tasks = []
-    if settings.switchbot_token and settings.switchbot_secret:
-        tasks.append(asyncio.create_task(refresh_names(settings, latest, stop)))
+    tasks: list[asyncio.Task] = []
 
     logger.info("スキャン開始（登録 %d 台、未登録の温湿度計を%s、%s 秒ごとに記録%s）",
                 len(settings.devices), "記録する" if settings.record_unknown else "記録しない",
@@ -530,7 +654,19 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
                     # bluetoothd の再起動などでスキャンが止まると、例外が出ないまま受信だけが途絶える。
                     # 異常終了して systemd（Restart=always）に再起動させる
                     raise RuntimeError(f"{silent:.0f} 秒間どのデバイスからも受信できていないため終了します")
+                if resolver is not None and resolver.due():
+                    tasks = [t for t in tasks if not t.done()]
+                    tasks.append(asyncio.create_task(resolver.update()))
                 points = latest.points(settings.stale_seconds)
+                if resolver is not None:
+                    held = [p for p in points if latest.name_pending(p["tags"]["mac_address"])]
+                    points = [p for p in points if not latest.name_pending(p["tags"]["mac_address"])]
+                    if dry_run:
+                        for p in held:
+                            print(p["tags"]["mac_address"], "（名前の取得待ち）", p["fields"], flush=True)
+                    elif pending is not None:
+                        pending.add(held)
+                        points += pending.release(latest.known_name)
                 if not points:
                     logger.debug("記録対象のデータがありません")
                 elif dry_run:
