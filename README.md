@@ -23,7 +23,7 @@ SwitchBot の温湿度計・プラグミニ・電池式の機器が発信して�
 
 ## InfluxDB に記録するデータ
 
-温湿度計は `switchbot_smartmeter` に、それ以外の機器は `switchbot_device` に記録します。
+温湿度計は `switchbot_smartmeter` に、それ以外の機器は `switchbot_device` に記録します。どちらにも機種を表す tag の `model` と、部屋を表す tag の `room` を付けます。
 
 ### 温湿度計（switchbot_smartmeter）
 
@@ -31,6 +31,8 @@ SwitchBot の温湿度計・プラグミニ・電池式の機器が発信して�
 |---|---|---|
 | tag | `mac_address` | デバイスの MAC アドレス（大文字） |
 | tag | `device_name` | デバイスの名前（決め方は「デバイスの名前と記録の対象」を参照） |
+| tag | `model` | 機種（`Meter`、`Meter Plus` など、「対応しているデバイス」の表の英語名） |
+| tag | `room` | 部屋（`devices.toml` に `room` を書いたデバイスだけ） |
 | field | `temperature` | 温度（℃、小数第1位まで） |
 | field | `humidity` | 湿度（0.0〜1.0。55% なら 0.55） |
 | field | `battery` | 電池残量（%） |
@@ -44,12 +46,13 @@ SwitchBot の温湿度計・プラグミニ・電池式の機器が発信して�
 | tag | `mac_address` | デバイスの MAC アドレス（大文字） |
 | tag | `device_name` | デバイスの名前 |
 | tag | `model` | 機種（`Plug Mini (JP)`、`Curtain` など、「対応しているデバイス」の表の英語名） |
+| tag | `room` | 部屋（`devices.toml` に `room` を書いたデバイスだけ） |
 | field | `power` | 消費電力（W、小数第1位まで。プラグミニのみ） |
 | field | `switch_on` | 電源がオンなら true（プラグミニのみ） |
 | field | `battery` | 電池残量（%。電池式の機器のみ） |
 | field | `rssi` | 受信した電波の強さ（dBm） |
 
-受信できなかった値は -1 などの仮の値で埋めず、記録から省きます。
+受信できなかった値は -1 などの仮の値で埋めず、記録から省きます。`model` の tag が無い系列ができないよう、機種が分かるまではそのデバイスのデータを記録しません。
 
 ## 必要なもの
 
@@ -79,13 +82,15 @@ sudo cp devices.example.toml devices.toml           # 名前を決めたいデ�
 
 「対応しているデバイス」の表にある機器は、`devices.toml` に書いていなくても記録します。`device_name` には、次の順で見つかった名前を使います。
 
-1. `devices.toml` に書いた名前
+1. `devices.toml` に書いた `name`
 2. SwitchBot アプリで付けた名前（`.env` に `SWITCHBOT_API_TOKEN` と `SWITCHBOT_API_SECRET` を設定したときだけ）
 3. MAC アドレス
 
+部屋は SwitchBot API から取得できないため、`room` は `devices.toml` に書いたデバイスにだけ付けます。部屋だけを決めたいデバイスは `name` を省いて `mac` と `room` だけを書けます。この場合、`device_name` には上の 2 か 3 の名前を使います。
+
 アプリで付けた名前は Bluetooth では送られてこないため、SwitchBot API から取得します。トークンとシークレットは、アプリの「プロフィール > 設定」で「アプリバージョン」を10回タップすると表示される「開発者向けオプション」で確認できます。
 
-SwitchBot API を呼び出すのは、`devices.toml` に書いていない機器を見つけたときです。すべての機器を `devices.toml` に書いていれば、API は呼び出しません。
+SwitchBot API を呼び出すのは、`devices.toml` に書いていない機器か、`name` を省いた機器を見つけたときです。すべての機器の `name` を `devices.toml` に書いていれば、API は呼び出しません。
 
 - 名前を取得できるまでは、10分（`SWITCHBOT_NAME_RETRY_SECONDS`）ごとに取得し直します。そのあいだのデータは InfluxDB に送らずに `pending.jsonl` に保存し、名前が分かったら、その名前で受信したときの時刻のまま送ります。MAC アドレスを名前にしたデータが混ざらないようにするためです。
 - 名前を取得できたあとも、名前の変更を反映するため、24時間（`SWITCHBOT_NAME_REFRESH_SECONDS`）ごとに取得します。アプリで名前を変えると `device_name` も変わるため、名前を固定したいデバイスは `devices.toml` に書いてください。
@@ -98,7 +103,12 @@ API のトークンを設定していないときは、MAC アドレスを名前
 ```toml
 [[devices]]
 mac  = "AA:BB:CC:DD:EE:01"   # SwitchBot アプリの「デバイス情報」で確認できます
-name = "リビング"             # InfluxDB の device_name タグになります
+name = "リビング"             # InfluxDB の device_name タグになります（省略できます）
+room = "リビング"             # InfluxDB の room タグになります（省略できます）
+
+[[devices]]
+mac  = "AA:BB:CC:DD:EE:03"   # 名前はアプリで付けたものを使い、部屋だけを決める例
+room = "キッチン"
 ```
 
 以前のバージョンで使っていた `type = "old"` / `type = "new"` は、書いたままでも動作します。機種は自動で判別するため、この値は使いません。
@@ -138,6 +148,13 @@ sudo git pull
 sudo mise install
 sudo mise exec -- uv sync --no-dev
 sudo systemctl restart switchbot_scan.service
+```
+
+v2.3.0 からは温湿度計にも tag の `model` と `room` を付けます。InfluxDB では tag が変わると別の系列になるため、更新の前と後でデータの系列が分かれます。Grafana などで1本の線として表示するには、Flux のクエリで `filter` のあとに次の2行を加え、従来の tag でまとめ直します。
+
+```flux
+  |> group(columns: ["_start", "_stop", "_measurement", "_field", "mac_address", "device_name"])
+  |> sort(columns: ["_time"])
 ```
 
 `mise.toml` の Python のバージョンを上げたときは、`.venv` を削除してから `mise exec -- uv sync --no-dev` を実行し、新しい Python で作り直してください。

@@ -137,7 +137,8 @@ def test_unknown_meter_is_recorded_with_mac_name():
     latest = sb.LatestReadings({}, record_unknown=True)
     latest.update("aa:bb:cc:dd:ee:09", service(battery=80, model="i"), manufacturer(1, 18, 40), rssi=-70)
     (point,) = latest.points(stale_seconds=60)
-    assert point["tags"] == {"mac_address": "AA:BB:CC:DD:EE:09", "device_name": "AA:BB:CC:DD:EE:09"}
+    assert point["tags"] == {"mac_address": "AA:BB:CC:DD:EE:09", "device_name": "AA:BB:CC:DD:EE:09",
+                             "model": "Meter Plus"}
     assert point["fields"]["rssi"] == -70
 
 
@@ -387,12 +388,12 @@ def test_curtain3_battery_from_manufacturer_data():
     assert r.battery == 0x55
 
 
-def test_meter_real_data_unchanged():
-    """温湿度計は従来どおり switchbot_smartmeter に、model の tag を付けずに記録する"""
+def test_meter_real_data():
+    """温湿度計は従来どおり switchbot_smartmeter に記録し、tag の model に機種を入れる"""
     latest = sb.LatestReadings({}, record_unknown=True)
     latest.update("AA:BB:CC:DD:EE:22", *real("540064089432", "c403089432"))
     (p,) = latest.points(stale_seconds=60)
-    assert p["measurement"] == "switchbot_smartmeter" and "model" not in p["tags"]
+    assert p["measurement"] == "switchbot_smartmeter" and p["tags"]["model"] == "Meter"
     assert p["fields"] == {"temperature": 20.8, "humidity": 0.5, "battery": 100}
 
 
@@ -411,3 +412,64 @@ def test_pending_store_keeps_measurement_and_model(tmp_path):
     assert p["measurement"] == "switchbot_device"
     assert p["tags"] == {"model": "Plug Mini (JP)", "mac_address": "AA:BB:CC:DD:EE:20", "device_name": "サーバー"}
     assert p["fields"] == {"power": 12.5, "switch_on": True}
+
+
+# --- 部屋（room）と、name を省いた devices.toml ------------------------------
+def test_load_devices_room_and_optional_name(tmp_path):
+    f = tmp_path / "devices.toml"
+    f.write_text('[[devices]]\nmac = "aa:bb:cc:dd:ee:01"\nname = "リビング"\nroom = "リビング"\n'
+                 '[[devices]]\nmac = "aa:bb:cc:dd:ee:02"\nroom = "玄関"\n', encoding="utf-8")
+    devices = sb.load_devices(f)
+    assert devices["AA:BB:CC:DD:EE:01"] == sb.Device(mac="AA:BB:CC:DD:EE:01", name="リビング", room="リビング")
+    assert devices["AA:BB:CC:DD:EE:02"] == sb.Device(mac="AA:BB:CC:DD:EE:02", name=None, room="玄関")
+
+
+@pytest.mark.parametrize("line", ['room = ""', "room = 1", 'name = "  "'])
+def test_load_devices_rejects_empty_values(tmp_path, line):
+    f = tmp_path / "devices.toml"
+    f.write_text(f'[[devices]]\nmac = "aa:bb:cc:dd:ee:01"\n{line}\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        sb.load_devices(f)
+
+
+def test_room_tag_and_api_name_for_entry_without_name():
+    """name を省いた機器は SwitchBot API の名前を待ち、room と model を tag に付けて記録する"""
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:24", room="玄関")
+    resolver, _ = make_resolver({})
+    latest = sb.LatestReadings({dev.mac: dev}, record_unknown=False, resolver=resolver)
+    latest.update(dev.mac, *real("248052", "158100520000"))   # ロック Pro
+    assert resolver.due() and latest.name_pending(dev.mac)   # 登録済みでも name が無ければ API で取得する
+    resolver.names = {dev.mac: "ロック"}
+    (p,) = latest.points(stale_seconds=60)
+    assert not latest.name_pending(dev.mac)
+    assert p["tags"] == {"mac_address": dev.mac, "device_name": "ロック", "model": "Smart Lock Pro", "room": "玄関"}
+
+
+def test_entry_without_name_uses_mac_without_api():
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:25", room="キッチン")
+    latest = sb.LatestReadings({dev.mac: dev}, record_unknown=False)
+    latest.update(dev.mac, *real("6a0064", "c78010310cbc"))
+    (p,) = latest.points(stale_seconds=60)
+    assert p["tags"]["device_name"] == dev.mac and p["tags"]["room"] == "キッチン"
+
+
+def test_registered_device_waits_for_model():
+    """機種が分かるまでは記録しない（tag の model が無い系列を作らないため）"""
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:26", name="リビング", room="リビング")
+    latest = sb.LatestReadings({dev.mac: dev})
+    latest.update(dev.mac, {}, manufacturer(1, 18, 40))
+    assert latest.points(stale_seconds=60) == []
+    latest.update(dev.mac, service(battery=90), {})
+    (p,) = latest.points(stale_seconds=60)
+    assert p["tags"] == {"mac_address": dev.mac, "device_name": "リビング", "model": "Meter", "room": "リビング"}
+
+
+def test_room_and_model_line_protocol():
+    from influxdb_client import Point, WritePrecision
+    dev = sb.Device(mac="AA:BB:CC:DD:EE:01", name="リビング", room="リビング")
+    when = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    p = sb.build_point(dev, sb.Reading(battery=90, temperature=21.0), when, "w")
+    line = Point.from_dict(p, write_precision=WritePrecision.NS).to_line_protocol()
+    assert line == (r"switchbot_smartmeter,device_name=リビング,mac_address=AA:BB:CC:DD:EE:01,"
+                    r"model=Indoor/Outdoor\ Thermo-Hygrometer,room=リビング "
+                    "battery=90i,temperature=21 1767225600000000000")

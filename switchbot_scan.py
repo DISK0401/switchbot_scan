@@ -34,8 +34,8 @@ from typing import Callable, Mapping, Optional
 
 logger = logging.getLogger("switchbot_scan")
 
-MEASUREMENT = "switchbot_smartmeter"   # 温湿度計（従来の系列を変えないため、tag は mac_address と device_name だけ）
-DEVICE_MEASUREMENT = "switchbot_device"  # 温湿度計以外の機器（tag に model を加える）
+MEASUREMENT = "switchbot_smartmeter"   # 温湿度計
+DEVICE_MEASUREMENT = "switchbot_device"  # 温湿度計以外の機器
 SWITCHBOT_COMPANY_ID = 0x0969  # Woan Technology（SwitchBot）の Bluetooth SIG 会社 ID
 SWITCHBOT_SERVICE_UUIDS = (
     "0000fd3d-0000-1000-8000-00805f9b34fb",  # 現行
@@ -50,7 +50,8 @@ SWITCHBOT_API_URL = "https://api.switch-bot.com/v1.1/devices"
 @dataclass(frozen=True)
 class Device:
     mac: str
-    name: str
+    name: Optional[str] = None  # None なら SwitchBot API の名前か MAC アドレスを使う
+    room: Optional[str] = None  # tag の room（SwitchBot API では取得できないため devices.toml に書く）
     type: str = "auto"  # 互換のため残している。機種は受信データから判別する
 
 
@@ -84,7 +85,13 @@ def load_devices(path: Path) -> dict[str, Device]:
         dev_type = str(entry.get("type", "auto"))
         if dev_type not in ("auto", "old", "new"):
             raise ValueError(f"{path}: {mac} の type は省略するか 'auto' / 'old' / 'new' を指定してください（{dev_type!r}）")
-        devices[mac] = Device(mac=mac, name=str(entry["name"]), type=dev_type)
+        values: dict[str, Optional[str]] = {}
+        for key in ("name", "room"):
+            value = entry.get(key)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{path}: {mac} の {key} は空でない文字列で指定してください（{value!r}）")
+            values[key] = value.strip() if value is not None else None
+        devices[mac] = Device(mac=mac, name=values["name"], room=values["room"], type=dev_type)
     return devices
 
 
@@ -293,7 +300,10 @@ def parser_for(model: Optional[str]) -> Callable[..., Reading]:
 
 
 def build_point(device: Device, reading: Reading, now: datetime, model: Optional[str] = None) -> dict:
-    """温湿度計は switchbot_smartmeter、それ以外の機器は switchbot_device（tag に model を加える）に記録する"""
+    """温湿度計は switchbot_smartmeter、それ以外の機器は switchbot_device に記録する。
+
+    tag の model（機種）は機種が分かったときだけ、room（部屋）は devices.toml に書いたときだけ付ける。
+    """
     fields: dict[str, float | int | bool] = {}
     if reading.temperature is not None:
         fields["temperature"] = float(reading.temperature)
@@ -309,11 +319,12 @@ def build_point(device: Device, reading: Reading, now: datetime, model: Optional
         fields["switch_on"] = bool(reading.switch_on)
     if reading.rssi is not None:
         fields["rssi"] = int(reading.rssi)
-    tags = {"mac_address": device.mac, "device_name": device.name}
-    measurement = MEASUREMENT
-    if model is not None and model not in METER_MODELS:
-        measurement = DEVICE_MEASUREMENT
+    tags = {"mac_address": device.mac, "device_name": device.name or device.mac}
+    if model is not None:
         tags["model"] = MODELS[model]
+    if device.room:
+        tags["room"] = device.room
+    measurement = DEVICE_MEASUREMENT if model is not None and model not in METER_MODELS else MEASUREMENT
     return {"measurement": measurement, "time": now, "tags": tags, "fields": fields}
 
 
@@ -449,14 +460,13 @@ class LatestReadings:
 
     def known_name(self, mac: str) -> Optional[str]:
         """devices.toml か SwitchBot API で分かった名前（分からなければ None）"""
-        if mac in self.devices:
+        if mac in self.devices and self.devices[mac].name:
             return self.devices[mac].name
         return self.resolver.name(mac) if self.resolver else None
 
     def device_for(self, mac: str) -> Device:
-        if mac in self.devices:
-            return self.devices[mac]
-        return Device(mac=mac, name=self.known_name(mac) or mac)
+        room = self.devices[mac].room if mac in self.devices else None
+        return Device(mac=mac, name=self.known_name(mac) or mac, room=room)
 
     def name_pending(self, mac: str) -> bool:
         """SwitchBot API で名前を取得するまで記録を待つデバイスか"""
@@ -474,7 +484,8 @@ class LatestReadings:
                 logger.info("%s %s として認識しました%s", label, MODELS[model],
                             "" if registered else "（devices.toml に未登録）")
             self._models[mac] = model
-            if not registered and self.record_unknown and self.resolver is not None:
+            named = registered and self.devices[mac].name
+            if not named and (registered or self.record_unknown) and self.resolver is not None:
                 self.resolver.request(mac)
         if not registered and not (self.record_unknown and mac in self._models):
             return
@@ -490,10 +501,11 @@ class LatestReadings:
     def points(self, stale_seconds: float) -> list[dict]:
         now_mono = time.monotonic()
         now = datetime.now(timezone.utc)
+        # 機種が分かるまでは記録しない（tag の model が無い系列が混ざらないようにするため）
         return [
-            build_point(self.device_for(mac), entry.reading, now, self._models.get(mac))
+            build_point(self.device_for(mac), entry.reading, now, self._models[mac])
             for mac, entry in self._latest.items()
-            if now_mono - entry.seen <= stale_seconds
+            if now_mono - entry.seen <= stale_seconds and mac in self._models
         ]
 
 
@@ -653,7 +665,8 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
     from bleak import BleakScanner  # BLE 環境でのみ必要なため遅延インポート
 
     resolver = None
-    if settings.record_unknown and settings.switchbot_token and settings.switchbot_secret:
+    unnamed = any(d.name is None for d in settings.devices.values())  # devices.toml で name を省いたデバイス
+    if (settings.record_unknown or unnamed) and settings.switchbot_token and settings.switchbot_secret:
         resolver = NameResolver(
             lambda: fetch_device_names(settings.switchbot_token, settings.switchbot_secret),
             retry_seconds=settings.name_retry_seconds, refresh_seconds=settings.name_refresh_seconds,
@@ -697,7 +710,7 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
 
     tasks: list[asyncio.Task] = []
 
-    logger.info("スキャン開始（登録 %d 台、未登録の温湿度計を%s、%s 秒ごとに記録%s）",
+    logger.info("スキャン開始（登録 %d 台、未登録のデバイスを%s、%s 秒ごとに記録%s）",
                 len(settings.devices), "記録する" if settings.record_unknown else "記録しない",
                 settings.interval_seconds, "、dry-run" if dry_run else "")
     try:
@@ -730,7 +743,8 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
                     logger.debug("記録対象のデータがありません")
                 elif dry_run:
                     for p in points:
-                        print(p["tags"]["device_name"], p["fields"], flush=True)
+                        extra = {k: v for k, v in p["tags"].items() if k in ("model", "room")}
+                        print(p["tags"]["device_name"], extra, p["fields"], flush=True)
                 elif spool is not None:
                     await asyncio.to_thread(spool.flush, write_lines, to_lines(points), is_retryable_error)
                 else:
