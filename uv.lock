@@ -250,7 +250,7 @@ wheels = [
 ]
 
 [[package]]
-name = "switchot-scan"
+name = "switchbot-scan"
 version = "2.3.0"
 source = { virtual = "." }
 dependencies = [

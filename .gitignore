@@ -206,7 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# --- switchot_scan: 実環境の設定（秘密情報・デバイス情報）はコミットしない ---
+# --- switchbot_scan: 実環境の設定（秘密情報・デバイス情報）はコミットしない ---
 .env
 devices.toml
 config.py
