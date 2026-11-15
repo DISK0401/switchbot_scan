@@ -1,7 +1,7 @@
 [project]
 name = "switchot-scan"
-version = "2.2.0"
-description = "SwitchBot 温湿度計の BLE アドバタイズを受信し、InfluxDB v2 に記録する"
+version = "2.3.0"
+description = "SwitchBot の温湿度計・プラグミニ・電池式の機器の BLE アドバタイズを受信し、InfluxDB v2 に記録する"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

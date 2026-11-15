@@ -1,6 +1,6 @@
 # switchot_scan
 
-SwitchBot 温湿度計が発信している Bluetooth Low Energy（BLE）のアドバタイズを受信し、温度・湿度・電池残量を InfluxDB v2 に記録する常駐プログラムです。計測値は SwitchBot ハブやクラウドを通さずに、手元の Linux マシンだけで集められます。
+SwitchBot の温湿度計・プラグミニ・電池式の機器が発信している Bluetooth Low Energy（BLE）のアドバタイズを受信し、温度・湿度・消費電力・電池残量を InfluxDB v2 に記録する常駐プログラムです。計測値は SwitchBot ハブやクラウドを通さずに、手元の Linux マシンだけで集められます。
 
 ## 対応しているデバイス
 
@@ -11,14 +11,24 @@ SwitchBot 温湿度計が発信している Bluetooth Low Energy（BLE）のア�
 | 防水温湿度計（Indoor/Outdoor Thermo-Hygrometer） | 温度・湿度・電池残量 |
 | 温湿度計 Pro（Meter Pro） | 温度・湿度・電池残量 |
 | CO2 センサー（Meter Pro CO2） | 温度・湿度・電池残量・CO2 濃度 |
+| プラグミニ（Plug Mini (JP) / (US)） | 消費電力・電源のオン/オフ |
+| カーテン（Curtain） | 電池残量 |
+| 指紋認証パッド（Keypad Touch） | 電池残量 |
+| ロック Pro（Smart Lock Pro） | 電池残量 |
+| テレビドアホン（Video Doorbell） | 電池残量 |
+
+ハブミニやシーリングライトのように電源につないで使う機器は、記録する値がないため対象にしていません。
 
 機種は受信したデータから自動で判別します。電池残量は Service Data から、温度と湿度は Manufacturer Data から読み、Manufacturer Data に温度と湿度が含まれない旧ファームウェアでは Service Data から読みます。解析の方法は Home Assistant が使っている [pySwitchbot](https://github.com/sblibs/pySwitchbot) に合わせています。
 
 ## InfluxDB に記録するデータ
 
+温湿度計は `switchbot_smartmeter` に、それ以外の機器は `switchbot_device` に記録します。
+
+### 温湿度計（switchbot_smartmeter）
+
 | 種類 | 名前 | 内容 |
 |---|---|---|
-| measurement | `switchbot_smartmeter` | |
 | tag | `mac_address` | デバイスの MAC アドレス（大文字） |
 | tag | `device_name` | デバイスの名前（決め方は「デバイスの名前と記録の対象」を参照） |
 | field | `temperature` | 温度（℃、小数第1位まで） |
@@ -26,6 +36,18 @@ SwitchBot 温湿度計が発信している Bluetooth Low Energy（BLE）のア�
 | field | `battery` | 電池残量（%） |
 | field | `co2` | CO2 濃度（ppm。Meter Pro CO2 のみ） |
 | field | `rssi` | 受信した電波の強さ（dBm。-40 なら強く、-90 なら弱い） |
+
+### 温湿度計以外の機器（switchbot_device）
+
+| 種類 | 名前 | 内容 |
+|---|---|---|
+| tag | `mac_address` | デバイスの MAC アドレス（大文字） |
+| tag | `device_name` | デバイスの名前 |
+| tag | `model` | 機種（`Plug Mini (JP)`、`Curtain` など、「対応しているデバイス」の表の英語名） |
+| field | `power` | 消費電力（W、小数第1位まで。プラグミニのみ） |
+| field | `switch_on` | 電源がオンなら true（プラグミニのみ） |
+| field | `battery` | 電池残量（%。電池式の機器のみ） |
+| field | `rssi` | 受信した電波の強さ（dBm） |
 
 受信できなかった値は -1 などの仮の値で埋めず、記録から省きます。
 
@@ -55,7 +77,7 @@ sudo cp devices.example.toml devices.toml           # 名前を決めたいデ�
 
 ### デバイスの名前と記録の対象
 
-受信した温湿度計は、`devices.toml` に書いていなくても記録します。`device_name` には、次の順で見つかった名前を使います。
+「対応しているデバイス」の表にある機器は、`devices.toml` に書いていなくても記録します。`device_name` には、次の順で見つかった名前を使います。
 
 1. `devices.toml` に書いた名前
 2. SwitchBot アプリで付けた名前（`.env` に `SWITCHBOT_API_TOKEN` と `SWITCHBOT_API_SECRET` を設定したときだけ）
@@ -63,15 +85,13 @@ sudo cp devices.example.toml devices.toml           # 名前を決めたいデ�
 
 アプリで付けた名前は Bluetooth では送られてこないため、SwitchBot API から取得します。トークンとシークレットは、アプリの「プロフィール > 設定」で「アプリバージョン」を10回タップすると表示される「開発者向けオプション」で確認できます。
 
-SwitchBot API を呼び出すのは、`devices.toml` に書いていない温湿度計を見つけたときです。すべての温湿度計を `devices.toml` に書いていれば、API は呼び出しません。
+SwitchBot API を呼び出すのは、`devices.toml` に書いていない機器を見つけたときです。すべての機器を `devices.toml` に書いていれば、API は呼び出しません。
 
 - 名前を取得できるまでは、10分（`SWITCHBOT_NAME_RETRY_SECONDS`）ごとに取得し直します。そのあいだのデータは InfluxDB に送らずに `pending.jsonl` に保存し、名前が分かったら、その名前で受信したときの時刻のまま送ります。MAC アドレスを名前にしたデータが混ざらないようにするためです。
 - 名前を取得できたあとも、名前の変更を反映するため、24時間（`SWITCHBOT_NAME_REFRESH_SECONDS`）ごとに取得します。アプリで名前を変えると `device_name` も変わるため、名前を固定したいデバイスは `devices.toml` に書いてください。
-- 自分のアカウントに登録していない温湿度計（近所のものなど）は、名前を取得できないため記録しません。そのデータは `pending.jsonl` に貯まり続け、上限（`SWITCHBOT_PENDING_MAX_MB`、既定は 10 MB）を超えると古いものから捨てます。
+- 自分のアカウントに登録していない機器（近所のものなど）は、名前を取得できないため記録しません。そのデータは `pending.jsonl` に貯まり続け、上限（`SWITCHBOT_PENDING_MAX_MB`、既定は 10 MB）を超えると古いものから捨てます。
 
-API のトークンを設定していないときは、MAC アドレスを名前にしてすぐに記録します。
-
-近所の温湿度計の電波まで届く環境では、それらも記録されます。`devices.toml` に書いたデバイスだけを記録するには、`.env` に `SWITCHBOT_RECORD_UNKNOWN=0` を設定します。
+API のトークンを設定していないときは、MAC アドレスを名前にしてすぐに記録します。この場合、近所の機器の電波まで届く環境では、それらも記録されます。`devices.toml` に書いたデバイスだけを記録するには、`.env` に `SWITCHBOT_RECORD_UNKNOWN=0` を設定します。
 
 ### devices.toml の書き方
 
