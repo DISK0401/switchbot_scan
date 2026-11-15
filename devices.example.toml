@@ -1,15 +1,22 @@
-# 対象の SwitchBot 温湿度計の一覧。
+# 対象の SwitchBot デバイスの一覧。
 # このファイルを devices.toml にコピーして実際の値を記入する（devices.toml は Git 管理外）。
 #
 # mac  : デバイスの MAC アドレス（SwitchBot アプリの「デバイス情報」で確認）
-# name : InfluxDB の device_name タグに記録される名前
-# 機種（Meter / Meter Plus / 防水温湿度計 / Meter Pro / Meter Pro CO2）は受信データから自動で判別する。
+# name : InfluxDB の device_name タグに記録される名前（省略すると SwitchBot API の名前か MAC アドレスを使う）
+# room : InfluxDB の room タグに記録される部屋（省略できる。SwitchBot API では取得できないため、ここに書く）
+# 機種（温湿度計、プラグミニ、カーテンなど。README の「対応しているデバイス」を参照）は受信データから自動で判別する。
 # 以前の版で使っていた type = "old" / "new" は書いたままでも動作する（値は使わない）。
 
 [[devices]]
 mac  = "AA:BB:CC:DD:EE:01"
 name = "リビング"
+room = "リビング"
 
 [[devices]]
 mac  = "AA:BB:CC:DD:EE:02"
 name = "屋外"
+
+# 名前はアプリで付けたものを使い、部屋だけを決める例
+[[devices]]
+mac  = "AA:BB:CC:DD:EE:03"
+room = "キッチン"

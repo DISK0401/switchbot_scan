@@ -1,5 +1,5 @@
 """
-SwitchBot 温湿度計の BLE アドバタイズを受信し、InfluxDB v2 に記録する。
+SwitchBot の温湿度計・プラグミニ・電池式の機器の BLE アドバタイズを受信し、InfluxDB v2 に記録する。
 
 設定:
   - 接続情報などの秘密情報 … 環境変数（.env から読み込み可。.env.example 参照）
@@ -34,7 +34,8 @@ from typing import Callable, Mapping, Optional
 
 logger = logging.getLogger("switchbot_scan")
 
-MEASUREMENT = "switchbot_smartmeter"
+MEASUREMENT = "switchbot_smartmeter"   # 温湿度計
+DEVICE_MEASUREMENT = "switchbot_device"  # 温湿度計以外の機器
 SWITCHBOT_COMPANY_ID = 0x0969  # Woan Technology（SwitchBot）の Bluetooth SIG 会社 ID
 SWITCHBOT_SERVICE_UUIDS = (
     "0000fd3d-0000-1000-8000-00805f9b34fb",  # 現行
@@ -49,7 +50,8 @@ SWITCHBOT_API_URL = "https://api.switch-bot.com/v1.1/devices"
 @dataclass(frozen=True)
 class Device:
     mac: str
-    name: str
+    name: Optional[str] = None  # None なら SwitchBot API の名前か MAC アドレスを使う
+    room: Optional[str] = None  # tag の room（SwitchBot API では取得できないため devices.toml に書く）
     type: str = "auto"  # 互換のため残している。機種は受信データから判別する
 
 
@@ -83,7 +85,13 @@ def load_devices(path: Path) -> dict[str, Device]:
         dev_type = str(entry.get("type", "auto"))
         if dev_type not in ("auto", "old", "new"):
             raise ValueError(f"{path}: {mac} の type は省略するか 'auto' / 'old' / 'new' を指定してください（{dev_type!r}）")
-        devices[mac] = Device(mac=mac, name=str(entry["name"]), type=dev_type)
+        values: dict[str, Optional[str]] = {}
+        for key in ("name", "room"):
+            value = entry.get(key)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{path}: {mac} の {key} は空でない文字列で指定してください（{value!r}）")
+            values[key] = value.strip() if value is not None else None
+        devices[mac] = Device(mac=mac, name=values["name"], room=values["room"], type=dev_type)
     return devices
 
 
@@ -158,6 +166,18 @@ METER_MODELS = {
     "4": "Meter Pro",
     "5": "Meter Pro CO2",
 }
+PLUG_MODELS = {
+    "j": "Plug Mini (JP)",
+    "g": "Plug Mini (US)",
+}
+# 電池残量だけを記録する機器（値は SwitchBot API の battery と一致することを確認したもの）
+BATTERY_MODELS = {
+    "c": "Curtain",
+    "y": "Keypad Touch",
+    "$": "Smart Lock Pro",
+    "9": "Video Doorbell",
+}
+MODELS = {**METER_MODELS, **PLUG_MODELS, **BATTERY_MODELS}
 CO2_MAX_PPM = 9999
 
 
@@ -167,11 +187,18 @@ class Reading:
     temperature: Optional[float] = None
     humidity: Optional[float] = None  # 0.0〜1.0（従来データとの互換のため % / 100 で記録）
     co2: Optional[int] = None  # ppm（Meter Pro CO2 のみ）
+    power: Optional[float] = None  # 消費電力 W（プラグミニのみ）
+    switch_on: Optional[bool] = None  # 電源のオン・オフ（プラグミニのみ）
     rssi: Optional[int] = None  # 受信した電波の強さ（dBm）
 
     def has_any(self) -> bool:
         """計測値を1つでも含むか（rssi は計測値に含めない）"""
-        return any(v is not None for v in (self.battery, self.temperature, self.humidity, self.co2))
+        return any(v is not None for v in (self.battery, self.temperature, self.humidity, self.co2,
+                                           self.power, self.switch_on))
+
+    def merged_with(self, old: "Reading") -> "Reading":
+        """受信できなかった値を、前回の値で補う"""
+        return Reading(**{k: (v if v is not None else getattr(old, k)) for k, v in vars(self).items()})
 
 
 def _decode_temperature(decimal_byte: int, integer_byte: int) -> float:
@@ -195,12 +222,12 @@ def _switchbot_service_data(service_data: Mapping[str, bytes]) -> Optional[bytes
 
 
 def detect_model(service_data: Mapping[str, bytes]) -> Optional[str]:
-    """Service Data の先頭バイトから機種コードを返す（温湿度計でなければ None）"""
+    """Service Data の先頭バイトから機種コードを返す（記録に対応していない機器なら None）"""
     data = _switchbot_service_data(service_data)
     if not data:
         return None
     code = chr(data[0] & 0b01111111)
-    return code if code in METER_MODELS else None
+    return code if code in MODELS else None
 
 
 def parse_meter(service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes],
@@ -235,8 +262,49 @@ def parse_meter(service_data: Mapping[str, bytes], manufacturer_data: Mapping[in
     return reading
 
 
-def build_point(device: Device, reading: Reading, now: datetime) -> dict:
-    fields: dict[str, float | int] = {}
+def parse_plug(service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes],
+               model: Optional[str] = None) -> Reading:
+    """プラグミニ: Manufacturer Data（会社 ID の後）の [7]=0x80 でオン、[10]〜[11] の下位15bit が 0.1 W 単位の消費電力"""
+    reading = Reading()
+    mdata = manufacturer_data.get(SWITCHBOT_COMPANY_ID)
+    if mdata is not None and len(mdata) >= 12:
+        reading.switch_on = mdata[7] == 0x80
+        reading.power = (int.from_bytes(mdata[10:12], "big") & 0x7FFF) / 10
+    return reading
+
+
+def parse_battery(service_data: Mapping[str, bytes], manufacturer_data: Mapping[int, bytes],
+                  model: Optional[str] = None) -> Reading:
+    """電池式の機器: 電池残量は Service Data の [2] の下位7bit
+
+    Smart Lock Pro は Manufacturer Data の [9]、Curtain 3（Manufacturer Data が13バイト以上）は [12] を使う。
+    """
+    reading = Reading()
+    data = _switchbot_service_data(service_data)
+    mdata = manufacturer_data.get(SWITCHBOT_COMPANY_ID)
+    if model == "$" and mdata is not None and len(mdata) >= 12:
+        reading.battery = mdata[9] & 0b01111111
+    elif model == "c" and mdata is not None and len(mdata) >= 13:
+        reading.battery = mdata[12] & 0b01111111
+    elif data is not None and len(data) >= 3:
+        reading.battery = data[2] & 0b01111111
+    return reading
+
+
+def parser_for(model: Optional[str]) -> Callable[..., Reading]:
+    if model in PLUG_MODELS:
+        return parse_plug
+    if model in BATTERY_MODELS:
+        return parse_battery
+    return parse_meter  # 温湿度計。機種がまだ分からない devices.toml のデバイスも温湿度計として扱う（従来どおり）
+
+
+def build_point(device: Device, reading: Reading, now: datetime, model: Optional[str] = None) -> dict:
+    """温湿度計は switchbot_smartmeter、それ以外の機器は switchbot_device に記録する。
+
+    tag の model（機種）は機種が分かったときだけ、room（部屋）は devices.toml に書いたときだけ付ける。
+    """
+    fields: dict[str, float | int | bool] = {}
     if reading.temperature is not None:
         fields["temperature"] = float(reading.temperature)
     if reading.humidity is not None:
@@ -245,14 +313,19 @@ def build_point(device: Device, reading: Reading, now: datetime) -> dict:
         fields["battery"] = int(reading.battery)
     if reading.co2 is not None:
         fields["co2"] = int(reading.co2)
+    if reading.power is not None:
+        fields["power"] = float(reading.power)
+    if reading.switch_on is not None:
+        fields["switch_on"] = bool(reading.switch_on)
     if reading.rssi is not None:
         fields["rssi"] = int(reading.rssi)
-    return {
-        "measurement": MEASUREMENT,
-        "time": now,
-        "tags": {"mac_address": device.mac, "device_name": device.name},
-        "fields": fields,
-    }
+    tags = {"mac_address": device.mac, "device_name": device.name or device.mac}
+    if model is not None:
+        tags["model"] = MODELS[model]
+    if device.room:
+        tags["room"] = device.room
+    measurement = DEVICE_MEASUREMENT if model is not None and model not in METER_MODELS else MEASUREMENT
+    return {"measurement": measurement, "time": now, "tags": tags, "fields": fields}
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +445,7 @@ class LatestReadings:
     """デバイスごとに最後に受信した値を保持する（新型は電池と温湿度が別パケットで届くため値をマージする）
 
     devices.toml に書いたデバイスはそのまま記録する。書いていないデバイスは、record_unknown が真で、
-    温湿度計だと機種を判別できたものだけを記録する（プラグなど別の機器のデータを温度として読まないため）。
+    記録に対応した機種だと判別できたものだけを記録する（機種ごとにデータの読み方が違うため）。
     名前は devices.toml → SwitchBot API → MAC アドレスの順に決める。
     """
 
@@ -387,14 +460,13 @@ class LatestReadings:
 
     def known_name(self, mac: str) -> Optional[str]:
         """devices.toml か SwitchBot API で分かった名前（分からなければ None）"""
-        if mac in self.devices:
+        if mac in self.devices and self.devices[mac].name:
             return self.devices[mac].name
         return self.resolver.name(mac) if self.resolver else None
 
     def device_for(self, mac: str) -> Device:
-        if mac in self.devices:
-            return self.devices[mac]
-        return Device(mac=mac, name=self.known_name(mac) or mac)
+        room = self.devices[mac].room if mac in self.devices else None
+        return Device(mac=mac, name=self.known_name(mac) or mac, room=room)
 
     def name_pending(self, mac: str) -> bool:
         """SwitchBot API で名前を取得するまで記録を待つデバイスか"""
@@ -409,34 +481,31 @@ class LatestReadings:
             if registered or self.record_unknown:
                 name = self.device_for(mac).name
                 label = f"{mac} を" if name == mac else f"{name}（{mac}）を"
-                logger.info("%s %s として認識しました%s", label, METER_MODELS[model],
+                logger.info("%s %s として認識しました%s", label, MODELS[model],
                             "" if registered else "（devices.toml に未登録）")
             self._models[mac] = model
-            if not registered and self.record_unknown and self.resolver is not None:
+            named = registered and self.devices[mac].name
+            if not named and (registered or self.record_unknown) and self.resolver is not None:
                 self.resolver.request(mac)
         if not registered and not (self.record_unknown and mac in self._models):
             return
-        new = parse_meter(service_data, manufacturer_data, self._models.get(mac))
+        model = self._models.get(mac)
+        new = parser_for(model)(service_data, manufacturer_data, model)
         if not new.has_any():
             return
         self.last_received = time.monotonic()
-        old = self._latest.get(mac, _Entry()).reading
-        merged = Reading(
-            battery=new.battery if new.battery is not None else old.battery,
-            temperature=new.temperature if new.temperature is not None else old.temperature,
-            humidity=new.humidity if new.humidity is not None else old.humidity,
-            co2=new.co2 if new.co2 is not None else old.co2,
-            rssi=rssi if rssi is not None else old.rssi,
-        )
+        new.rssi = rssi
+        merged = new.merged_with(self._latest.get(mac, _Entry()).reading)
         self._latest[mac] = _Entry(merged, time.monotonic())
 
     def points(self, stale_seconds: float) -> list[dict]:
         now_mono = time.monotonic()
         now = datetime.now(timezone.utc)
+        # 機種が分かるまでは記録しない（tag の model が無い系列が混ざらないようにするため）
         return [
-            build_point(self.device_for(mac), entry.reading, now)
+            build_point(self.device_for(mac), entry.reading, now, self._models[mac])
             for mac, entry in self._latest.items()
-            if now_mono - entry.seen <= stale_seconds
+            if now_mono - entry.seen <= stale_seconds and mac in self._models
         ]
 
 
@@ -534,7 +603,7 @@ class Spool:
 
 
 class PendingStore:
-    """SwitchBot API で名前を取得できるまで、未登録の温湿度計のデータを保存しておく。
+    """SwitchBot API で名前を取得できるまで、devices.toml に無いデバイスのデータを保存しておく。
 
     名前が分かったら、その名前を device_name にして、受信したときの時刻のまま送る。
     ファイル（JSON Lines）に保存するため、再起動しても失われない。max_bytes を超えたら古いものから捨てる。
@@ -550,6 +619,8 @@ class PendingStore:
         self._file.append([json.dumps({
             "mac": p["tags"]["mac_address"],
             "time": int(p["time"].timestamp() * 1_000_000) * 1000,  # ns（マイクロ秒の精度）
+            "measurement": p["measurement"],
+            "tags": {k: v for k, v in p["tags"].items() if k not in ("mac_address", "device_name")},
             "fields": p["fields"],
         }, ensure_ascii=False) for p in points])
         self.macs.update(p["tags"]["mac_address"] for p in points)
@@ -566,9 +637,9 @@ class PendingStore:
                 kept.append(line)
                 continue
             released.append({
-                "measurement": MEASUREMENT,
+                "measurement": entry.get("measurement", MEASUREMENT),
                 "time": entry["time"],
-                "tags": {"mac_address": entry["mac"], "device_name": name},
+                "tags": {**entry.get("tags", {}), "mac_address": entry["mac"], "device_name": name},
                 "fields": entry["fields"],
             })
         self._file._rewrite(kept)
@@ -594,7 +665,8 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
     from bleak import BleakScanner  # BLE 環境でのみ必要なため遅延インポート
 
     resolver = None
-    if settings.record_unknown and settings.switchbot_token and settings.switchbot_secret:
+    unnamed = any(d.name is None for d in settings.devices.values())  # devices.toml で name を省いたデバイス
+    if (settings.record_unknown or unnamed) and settings.switchbot_token and settings.switchbot_secret:
         resolver = NameResolver(
             lambda: fetch_device_names(settings.switchbot_token, settings.switchbot_secret),
             retry_seconds=settings.name_retry_seconds, refresh_seconds=settings.name_refresh_seconds,
@@ -638,7 +710,7 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
 
     tasks: list[asyncio.Task] = []
 
-    logger.info("スキャン開始（登録 %d 台、未登録の温湿度計を%s、%s 秒ごとに記録%s）",
+    logger.info("スキャン開始（登録 %d 台、未登録のデバイスを%s、%s 秒ごとに記録%s）",
                 len(settings.devices), "記録する" if settings.record_unknown else "記録しない",
                 settings.interval_seconds, "、dry-run" if dry_run else "")
     try:
@@ -671,7 +743,8 @@ async def run(settings: Settings, dry_run: bool, once: bool) -> None:
                     logger.debug("記録対象のデータがありません")
                 elif dry_run:
                     for p in points:
-                        print(p["tags"]["device_name"], p["fields"], flush=True)
+                        extra = {k: v for k, v in p["tags"].items() if k in ("model", "room")}
+                        print(p["tags"]["device_name"], extra, p["fields"], flush=True)
                 elif spool is not None:
                     await asyncio.to_thread(spool.flush, write_lines, to_lines(points), is_retryable_error)
                 else:
