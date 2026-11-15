@@ -1,4 +1,4 @@
-# switchot_scan
+# switchbot_scan
 
 SwitchBot の温湿度計・プラグミニ・電池式の機器が発信している Bluetooth Low Energy（BLE）のアドバタイズを受信し、温度・湿度・消費電力・電池残量を InfluxDB v2 に記録する常駐プログラムです。計測値は SwitchBot ハブやクラウドを通さずに、手元の Linux マシンだけで集められます。
 
@@ -66,7 +66,7 @@ SwitchBot の温湿度計・プラグミニ・電池式の機器が発信して�
 sudo apt install bluez
 # mise が未導入の場合は https://mise.jdx.dev/installing-mise.html の手順で入れる
 
-sudo git clone https://github.com/DISK0401/switchot_scan.git /opt/switchbot
+sudo git clone https://github.com/DISK0401/switchbot_scan.git /opt/switchbot
 cd /opt/switchbot
 sudo mise trust                # この mise.toml の設定を使うことを許可
 sudo mise install              # mise.toml に書いた Python 3.15 と uv を用意
@@ -165,8 +165,8 @@ Windows では、Bluetooth アダプターがあれば同じプログラムで�
 
 ```powershell
 winget install jdx.mise
-git clone https://github.com/DISK0401/switchot_scan.git
-cd switchot_scan
+git clone https://github.com/DISK0401/switchbot_scan.git
+cd switchbot_scan
 mise trust; mise install
 mise exec -- uv sync --no-dev
 Copy-Item .env.example .env; Copy-Item devices.example.toml devices.toml   # それぞれ記入する
@@ -176,7 +176,7 @@ mise exec -- uv run python switchbot_scan.py --dry-run --once
 Windows には systemd がないため、ウォッチドッグで終了したあとに起動し直す処理を自分で用意します。たとえば、次の内容の PowerShell スクリプトを、タスク スケジューラで「ログオン時」に実行するよう登録します。
 
 ```powershell
-Set-Location C:\path\to\switchot_scan
+Set-Location C:\path\to\switchbot_scan
 while ($true) {
     .\.venv\Scripts\python.exe switchbot_scan.py
     Start-Sleep -Seconds 10
